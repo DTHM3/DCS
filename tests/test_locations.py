@@ -1,8 +1,9 @@
+from datetime import datetime, timedelta
 import boto3
 import time
 import uuid
 from prometheus_client import Summary, Counter, start_http_server
-
+import sys
 # Start Prometheus metrics server
 start_http_server(8000)
 
@@ -18,7 +19,12 @@ boto3.set_stream_logger('boto3', level=logging.DEBUG)
 # Results dictionary for latency comparison
 latency_results = {}
 
-def compare_server_latency():
+global bucket_names
+bucket_names = []
+global bucket_regions
+bucket_regions = []
+
+def compare_server_latency(num_ops = 1):
     regions = [
         "us-east-1",  # US East (N. Virginia)
         "us-west-1",  # US West (N. California)
@@ -39,7 +45,8 @@ def compare_server_latency():
     for region in regions:
         # Generate a unique bucket name
         bucket_name = f"latency-test-bucket-{region}-{uuid.uuid4().hex[:8]}"
-
+        bucket_names.append(bucket_name)
+        bucket_regions.append(region)
         s3 = boto3.client("s3", region_name=region)
 
         try:
@@ -60,7 +67,7 @@ def compare_server_latency():
             response = s3.get_object(Bucket=bucket_name, Key=key_name)
             assert response["Body"].read().decode("utf-8") == body_content
             operation_successes.inc()
-            operation_latency_val = time.time() - operation_start
+            operation_latency_val = (time.time() - operation_start) * num_ops
 
             # Store latency data
             latency_results[region] = {
@@ -75,5 +82,39 @@ def compare_server_latency():
             operation_failures.inc()
             print(f"Operation failed for region {region}: {e}")
 
+def get_replication_metrics(bucket_name, bucket_region):
+    cloudwatch = boto3.client("cloudwatch", region_name=bucket_region)
+    metrics = cloudwatch.get_metric_data(
+        MetricDataQueries=[
+            {
+                "Id": "replication_operations",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/S3",
+                        "MetricName": "NumberOfOperations",
+                        "Dimensions": [
+                            {"Name": "BucketName", "Value": bucket_name},
+                            {"Name": "FilterId", "Value": "EntireBucket"}
+                        ],
+                    },
+                    "Period": 300,
+                    "Stat": "Sum",
+                },
+                "ReturnData": True,
+            }
+        ],
+        StartTime=datetime.utcnow() - timedelta(hours=1),
+        EndTime=datetime.utcnow(),
+    )
+    return metrics
+
+
 if __name__ == "__main__":
-    compare_server_latency()
+    if len(sys.argv) == 0:
+        num_ops = 1
+    else:
+        num_ops = int(sys.argv[1])
+    if num_ops < 1:
+        num_ops = 1
+        print(f"Argument for number of operations must be an integer >= 1, running 1 operation.")
+    compare_server_latency(num_ops)
